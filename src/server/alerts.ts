@@ -8,7 +8,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import { AuthorsDoc, ChatDoc } from "./docs.ts";
-import { describe } from "./errors.ts";
+import { describe, HttpError } from "./errors.ts";
 import { entryText, projectEntry, snippet } from "./projection.ts";
 import { span, type WaitView } from "./limit-gate.ts";
 import { DEFAULT_PREFS, type EmbedderMessage, type PushMessage, type PushPrefs } from "./push.ts";
@@ -28,11 +28,50 @@ const DISGUISING = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 export class Alerts {
     readonly #app: PocketApp;
     readonly #doneTimers = new Map<ConversationId, NodeJS.Timeout>();
+    readonly #pushes = new Map<ConversationId, Set<AbortController>>();
     /** Approvals already announced, so each one is pushed once. */
-    #approvalIds = new Set<string>();
+    #approvalIds = new Map<string, ConversationId>();
 
     constructor(app: PocketApp) {
         this.#app = app;
+    }
+
+    /** Stop scoped notifications before their conversation documents are purged. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        this.forgetSessions(ids);
+    }
+
+    /** Forget only these sessions; notification preferences and subscriptions are global. */
+    forgetSessions(ids: readonly ConversationId[]): void {
+        for (const id of ids) {
+            clearTimeout(this.#doneTimers.get(id));
+            this.#doneTimers.delete(id);
+
+            for (const controller of this.#pushes.get(id) ?? []) {
+                controller.abort();
+            }
+
+            this.#pushes.delete(id);
+        }
+
+        for (const [approvalId, id] of this.#approvalIds) {
+            if (ids.includes(id)) {
+                this.#approvalIds.delete(approvalId);
+            }
+        }
+    }
+
+    #available(id: ConversationId): boolean {
+        try {
+            this.#app.sessionCleanup.assertAvailable(id);
+            return true;
+        } catch (error) {
+            if (error instanceof HttpError && (error.status === 404 || error.status === 409)) {
+                return false;
+            }
+
+            throw error;
+        }
     }
 
     /**
@@ -52,7 +91,7 @@ export class Alerts {
         const store = app.pushStore;
         const user = app.config.userById(userId);
 
-        if (user === undefined || !app.canSee(user, id)) {
+        if (!this.#available(id) || user === undefined || !app.canSee(user, id)) {
             return;
         }
 
@@ -80,10 +119,32 @@ export class Alerts {
         // Push services want a real contact; Apple rejects placeholders. A tunnel's https address will do.
         const subject = app.access?.url?.startsWith("https://") ? app.access.url : undefined;
 
-        await store.notify(userId, message, {
-            urgency,
-            ...(subject === undefined ? {} : { subject }),
-        });
+        const controller = new AbortController();
+        let pending = this.#pushes.get(id);
+
+        if (pending === undefined) {
+            pending = new Set();
+            this.#pushes.set(id, pending);
+        }
+
+        pending.add(controller);
+
+        try {
+            await store.notify(userId, message, {
+                urgency,
+                ...(subject === undefined ? {} : { subject }),
+                fetch: (input, init) => {
+                    app.sessionCleanup.assertAvailable(id);
+                    return fetch(input, { ...init, signal: controller.signal });
+                },
+            });
+        } finally {
+            pending.delete(controller);
+
+            if (this.#pushes.get(id) === pending && pending.size === 0) {
+                this.#pushes.delete(id);
+            }
+        }
     }
 
     /** A run started or ended. "Pi finished" goes out once it has stayed finished for a moment. */
@@ -91,7 +152,7 @@ export class Alerts {
         clearTimeout(this.#doneTimers.get(id));
         this.#doneTimers.delete(id);
 
-        if (busy || this.#app.sessionMeta(id) === undefined || this.#quiet()) {
+        if (!this.#available(id) || busy || this.#app.sessionMeta(id) === undefined || this.#quiet()) {
             return;
         }
 
@@ -109,17 +170,22 @@ export class Alerts {
     async #pushDone(id: ConversationId): Promise<void> {
         const app = this.#app;
 
-        if (app.isBusy(id)) {
+        if (!this.#available(id) || app.isBusy(id)) {
             return;
         }
 
         const conversation = await app.harness.conversation(id, context);
 
-        if (conversation === undefined) {
+        if (!this.#available(id) || conversation === undefined) {
             return;
         }
 
         const page = await conversation.entries({}, 12, undefined, context);
+
+        if (!this.#available(id)) {
+            return;
+        }
+
         const last = page.items
             .map((entry) => projectEntry(entry))
             .find((entry) => entry?.kind === "assistant");
@@ -129,6 +195,11 @@ export class Alerts {
         }
 
         const title = await app.conversationTitle(id);
+
+        if (!this.#available(id)) {
+            return;
+        }
+
         const failed = last.stopReason === "error";
         // PiP's answers open its panel, over whatever the app shows, rather than a session.
         const pip = app.sessionMeta(id)?.pip !== undefined;
@@ -165,12 +236,17 @@ export class Alerts {
         const id = conversationId as unknown as ConversationId;
         const root = app.rootOf(id);
 
-        if (this.#quiet() || app.sessionMeta(root) === undefined) {
+        if (!this.#available(id) || !this.#available(root) || this.#quiet() || app.sessionMeta(root) === undefined) {
             return;
         }
 
         void (async () => {
             const title = await app.conversationTitle(root);
+
+            if (!this.#available(id) || !this.#available(root)) {
+                return;
+            }
+
             const who = app.sessionMeta(root)?.pip === undefined ? "" : "PiP: ";
             const message: PushMessage = {
                 title: `Waiting for a usage limit · ${who}${title}`,
@@ -183,6 +259,10 @@ export class Alerts {
             };
 
             for (const userId of await this.participants(root)) {
+                if (!this.#available(id) || !this.#available(root)) {
+                    return;
+                }
+
                 const user = app.config.userById(userId);
 
                 if (user !== undefined && user.role !== "viewer") {
@@ -195,10 +275,10 @@ export class Alerts {
     /** New approvals go out to everyone in the session who can answer them. */
     announceApprovals(): void {
         const app = this.#app;
-        const pending = app.approvals.all();
+        const pending = app.approvals.all().filter((approval) => this.#available(approval.conversationId));
         const fresh = pending.filter((approval) => !this.#approvalIds.has(approval.id));
 
-        this.#approvalIds = new Set(pending.map((approval) => approval.id));
+        this.#approvalIds = new Map(pending.map((approval) => [approval.id, approval.conversationId]));
 
         if (this.#quiet()) {
             return;
@@ -207,7 +287,17 @@ export class Alerts {
         for (const approval of fresh) {
             void (async () => {
                 const root = app.rootOf(approval.conversationId);
+
+                if (!this.#available(approval.conversationId) || !this.#available(root)) {
+                    return;
+                }
+
                 const title = await app.conversationTitle(root);
+
+                if (!this.#available(approval.conversationId) || !this.#available(root)) {
+                    return;
+                }
+
                 const call = `${approval.tool}: ${approval.subject}`;
                 const shown =
                     !DISGUISING.test(approval.subject) && call.length <= MAX_NOTIFIED_CALL;
@@ -279,6 +369,11 @@ export class Alerts {
         const app = this.#app;
         const root = app.rootOf(id);
         const people = new Set<string>();
+
+        if (!this.#available(id) || !this.#available(root)) {
+            return people;
+        }
+
         const createdBy = app.sessionMeta(root)?.createdBy;
 
         if (createdBy !== undefined) {
@@ -291,6 +386,10 @@ export class Alerts {
             people.add(userId);
         }
 
+        if (!this.#available(id) || !this.#available(root)) {
+            return new Set();
+        }
+
         for (const message of (await app.harness.snapshot(ChatDoc, root, context))?.messages ??
             []) {
             if (message.kind !== "event") {
@@ -298,7 +397,7 @@ export class Alerts {
             }
         }
 
-        return people;
+        return this.#available(id) && this.#available(root) ? people : new Set();
     }
 
     close(): void {
@@ -307,5 +406,13 @@ export class Alerts {
         }
 
         this.#doneTimers.clear();
+
+        for (const pending of this.#pushes.values()) {
+            for (const controller of pending) {
+                controller.abort();
+            }
+        }
+
+        this.#pushes.clear();
     }
 }

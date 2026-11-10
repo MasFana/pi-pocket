@@ -125,6 +125,7 @@ export class Schedules {
     /** Send a schedule's message, unless it may not go out anymore; then wait for the next time, or finish. */
     async #send(id: string, runtime: Runtime, context: Context): Promise<void> {
         const conversationId = runtime.conversationId;
+        this.#app.sessionCleanup.assertAvailable(conversationId);
         const schedule = await stored(runtime, id, context);
         const conversation = await runtime.conversation(conversationId, context);
 
@@ -273,6 +274,7 @@ export class Schedules {
     /** Set up a message to Pi. Throws an HttpError a person can act on when the time or the message will not do. */
     async add(conversationId: ConversationId, request: ScheduleRequest): Promise<Schedule> {
         const app = this.#app;
+        app.sessionCleanup.assertAvailable(conversationId);
 
         if (!this.running) {
             throw new HttpError(409, "Schedules are turned off in Extensions.");
@@ -323,6 +325,7 @@ export class Schedules {
                 : app.commands.messageText(by, `${SCHEDULED_PREFIX}${text}`);
 
         return app.harness.commit(async (tx) => {
+            app.sessionCleanup.assertAvailable(conversationId);
             const doc = await tx.doc(ScheduleDoc, conversationId);
             const same =
                 request.key === undefined

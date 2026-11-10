@@ -50,9 +50,38 @@ export class HiddenValues {
     readonly #values = new Set<Hidden>();
     /** The session a conversation belongs to: a subagent's values are its session's. */
     readonly #rootOf: (conversationId: number) => number;
+    /** Admission comes from the app's central deletion seal, not a second set of deleted IDs. */
+    readonly #assertAvailable: ((conversationId: number) => void) | undefined;
+    /** Live redaction buffers and their captured secrets, scoped to the command's conversation. */
+    readonly #streams = new Map<number, Set<() => void>>();
 
-    constructor(rootOf: (conversationId: number) => number = (id) => id) {
+    constructor(
+        rootOf: (conversationId: number) => number = (id) => id,
+        assertAvailable?: (conversationId: number) => void,
+    ) {
         this.#rootOf = rootOf;
+        this.#assertAvailable = assertAvailable;
+    }
+
+    /** Drop selected scoped secrets and live buffers; global values and every survivor remain untouched. */
+    forgetSessions(ids: readonly ConversationId[]): void {
+        const selected = new Set(ids.map(Number));
+
+        for (const entry of this.#values) {
+            if (entry.conversationId !== undefined && selected.has(entry.conversationId)) {
+                this.#values.delete(entry);
+                entry.value = "";
+                entry.replacement = "";
+            }
+        }
+
+        for (const id of selected) {
+            for (const forget of this.#streams.get(id) ?? []) {
+                forget();
+            }
+
+            this.#streams.delete(id);
+        }
     }
 
     /** Hide a value until the returned function is called. A value out of bounds throws. */
@@ -74,6 +103,10 @@ export class HiddenValues {
             (!Number.isSafeInteger(conversationId) || conversationId < 1)
         ) {
             throw new Error("host.hide: conversationId is a session's id");
+        }
+
+        if (conversationId !== undefined) {
+            this.#assertAvailable?.(conversationId);
         }
 
         if (this.#values.size >= MAX_HIDDEN_VALUES) {
@@ -191,12 +224,24 @@ export class HiddenValues {
         conversationId: ConversationId | number,
         onOutput: NonNullable<ShellExecOptions["onOutput"]>,
     ): { onOutput: NonNullable<ShellExecOptions["onOutput"]>; flush: () => void } {
+        const id = Number(conversationId);
+        this.#assertAvailable?.(id);
         const values = this.for(conversationId);
         const hold = Math.max(0, ...values.map((each) => each.value.length)) - 1;
         const pending = new Map<
             string,
             { text: string; context: Context; info: ShellOutputInfo }
         >();
+        let forgotten = false;
+        const streams = this.#streams.get(id) ?? new Set<() => void>();
+        const forget = () => {
+            forgotten = true;
+            pending.clear();
+            values.length = 0;
+        };
+
+        streams.add(forget);
+        this.#streams.set(id, streams);
 
         const emit = (text: string, context: Context, info: ShellOutputInfo) => {
             if (text !== "" || info.skipped !== undefined) {
@@ -216,6 +261,10 @@ export class HiddenValues {
 
         return {
             onOutput: (text, context, info) => {
+                if (forgotten) {
+                    return;
+                }
+
                 // Output keeps its order: what the other stream holds back goes out before this chunk. A value one
                 // stream writes in two pieces, with the other stream's output between them, is then not joined.
                 flushOne(info.stream === "stdout" ? "stderr" : "stdout");
@@ -235,6 +284,12 @@ export class HiddenValues {
             flush: () => {
                 flushOne("stdout");
                 flushOne("stderr");
+                forget();
+                streams.delete(forget);
+
+                if (streams.size === 0 && this.#streams.get(id) === streams) {
+                    this.#streams.delete(id);
+                }
             },
         };
     }

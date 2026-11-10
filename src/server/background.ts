@@ -23,11 +23,13 @@ import {
     closeSync,
     existsSync,
     mkdirSync,
+    lstatSync,
     openSync,
     readdirSync,
     readFileSync,
     readSync,
     rmSync,
+    rmdirSync,
     statSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -421,6 +423,7 @@ export class BackgroundTasks {
     beforeSpawn: (() => Promise<void>) | undefined;
     beforeRecord: (() => Promise<void>) | undefined;
     #sweeper: ReturnType<typeof setInterval> | undefined;
+    readonly #starts = new Map<ConversationId, Set<Promise<void>>>();
     /** Whether `split` was found. */
     #split = false;
     /** The durable task behind each background command; the background extension installs it. */
@@ -1252,6 +1255,7 @@ export class BackgroundTasks {
 
     /** Where Pi can start one: a session's own conversation, not a subagent's or PiP's. */
     #check(conversationId: ConversationId): void {
+        this.#app.sessionCleanup.assertAvailable(conversationId);
         if (!this.running) {
             throw new HttpError(409, "Background tasks are turned off in Extensions.");
         }
@@ -1275,11 +1279,27 @@ export class BackgroundTasks {
         }
     }
 
+    /** Fence starts already preparing their environment, including starts not represented by a loaded agent. */
+    async start(conversationId: ConversationId, request: BackgroundStart, signal?: AbortSignal): Promise<BackgroundTask> {
+        this.#app.sessionCleanup.assertAvailable(conversationId);
+        const { promise, resolve } = Promise.withResolvers<void>();
+        const starts = this.#starts.get(conversationId) ?? new Set();
+        starts.add(promise);
+        this.#starts.set(conversationId, starts);
+        try {
+            return await this.#start(conversationId, request, signal);
+        } finally {
+            starts.delete(promise);
+            if (starts.size === 0) this.#starts.delete(conversationId);
+            resolve();
+        }
+    }
+
     /**
      * Start a command in the background. Throws an HttpError Pi can act on when it may not start. A start that `signal`
      * cancels before its process starts leaves nothing behind.
      */
-    async start(
+    async #start(
         conversationId: ConversationId,
         request: BackgroundStart,
         signal?: AbortSignal,
@@ -1313,6 +1333,7 @@ export class BackgroundTasks {
 
         // Reserved with its watch in one commit: the limit and the key hold for starts at the same time.
         const reserved = await app.harness.commit(async (tx) => {
+            app.sessionCleanup.assertAvailable(conversationId);
             const doc = await tx.doc(BackgroundDoc, conversationId);
             const items = Object.values(doc.items);
             const same =
@@ -1390,6 +1411,7 @@ export class BackgroundTasks {
             }
 
             await this.beforeSpawn?.();
+            app.sessionCleanup.assertAvailable(conversationId);
             this.#needsSplit();
 
             const spawned = this.#spawn(conversationId, item, added);
@@ -1738,5 +1760,86 @@ export class BackgroundTasks {
     /** Whether any process of a task's group runs: for tests and checks. */
     alive(conversationId: ConversationId, item: BackgroundTask): boolean {
         return this.#alive(conversationId, item, true);
+    }
+
+    /** Markers prove ownership even when an ended daemon's record was pruned or its watcher is not loaded. */
+    #scopeProcesses(ids: ReadonlySet<number>): { info: ProcInfo; marker: string }[] {
+        if (!hasProc) return [];
+        const prefix = `${BACKGROUND_MARKER}=${this.#app.dataDir}#`;
+        const owned: { info: ProcInfo; marker: string }[] = [];
+        for (const info of processes(true)) {
+            let marker: string | undefined;
+            try {
+                marker = readFileSync(`${PROC}/${info.pid}/environ`, "utf8").split("\0").find((item) => item.startsWith(prefix));
+            } catch { continue; }
+            if (marker === undefined) continue;
+            const match = /^(\d+)\/\w+$/.exec(marker.slice(prefix.length));
+            if (match !== null && ids.has(Number(match[1]))) {
+                owned.push({ info, marker: marker.slice(BACKGROUND_MARKER.length + 1) });
+            }
+        }
+        return owned;
+    }
+
+    /** Native task abort follows this hook; stop daemons even when their durable watcher already ended. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        await Promise.all(ids.flatMap((id) => [...(this.#starts.get(id) ?? [])]));
+        for (const conversationId of ids) {
+            const items = Object.values((await this.#app.harness.snapshot(BackgroundDoc, conversationId, context))?.items ?? {});
+            if (items.length > 0 && !hasProc) {
+                throw new HttpError(501, "Session cleanup cannot prove background process ownership without Linux /proc.");
+            }
+            for (const item of items) {
+                await this.#kill(conversationId, item);
+                const deadline = Date.now() + 3000;
+                while ((this.#alive(conversationId, item, true) || this.#left(conversationId, item).length > 0) && Date.now() < deadline) {
+                    await wait(50);
+                }
+                if (this.#alive(conversationId, item, true) || this.#left(conversationId, item).length > 0) {
+                    throw new Error(`Background task ${item.id} still has live owned processes; deletion was not committed.`);
+                }
+            }
+        }
+        const scope = new Set(ids.map(Number));
+        const signal = (name: NodeJS.Signals) => {
+            for (const { info, marker } of this.#scopeProcesses(scope)) {
+                // Revalidate both identity and marker immediately before signaling, never a bare reused PID.
+                if (procStat(info.pid)?.start === info.start && marked(info.pid, marker)) kill(info.pid, name);
+            }
+        };
+        signal("SIGTERM");
+        const grace = Date.now() + this.timing.grace;
+        while (this.#scopeProcesses(scope).length > 0 && Date.now() < grace) await wait(100);
+        signal("SIGKILL");
+        const deadline = Date.now() + 3000;
+        while (this.#scopeProcesses(scope).length > 0 && Date.now() < deadline) await wait(100);
+        if (this.#scopeProcesses(scope).length > 0) {
+            throw new Error("Owned background processes survived termination; deletion was not committed.");
+        }
+    }
+
+    /** Only native background log/exit names are owned; never recurse into arbitrary files or project folders. */
+    finishSessionDeletion(ids: readonly ConversationId[]): void {
+        const errors: string[] = [];
+        for (const id of ids) {
+            try {
+                const dir = this.#dir(id);
+                if (!existsSync(dir)) continue;
+                // Numeric names are not ownership proof if a native directory was replaced by a symlink.
+                if (lstatSync(join(this.#app.dataDir, "background")).isSymbolicLink() ||
+                    !lstatSync(dir).isDirectory() || lstatSync(dir).isSymbolicLink()) {
+                    throw new Error("Background logs were preserved: their folder is not an owned native directory.");
+                }
+                for (const name of readdirSync(dir)) {
+                    if (/^\w+\.(?:log(?:\.[a-z]{6})?|exit)$/.test(name)) {
+                        rmSync(join(dir, name), { force: true });
+                    }
+                }
+                rmdirSync(dir);
+            } catch (error) {
+                errors.push(`Session ${String(id)}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        if (errors.length > 0) throw new Error(errors.join("; "));
     }
 }

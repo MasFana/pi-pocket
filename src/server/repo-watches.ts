@@ -184,6 +184,7 @@ export class RepoWatches {
     timing = { poll: POLL_MS, soon: SOON_MS, retry: RETRY_MS };
     /** When each watch's recent messages went, for the hourly limit. Memory only: a restart forgives. */
     readonly #sent = new Map<string, number[]>();
+    readonly #removing = new Set<string>();
     /** Who `gh` is signed in as on each host, and when that was asked. */
     readonly #viewers = new Map<string, { login: string; at: number }>();
     readonly task: Task<WatchInput, WatchState, null, object>;
@@ -217,7 +218,7 @@ export class RepoWatches {
                 runtime.commit(async (tx) => {
                     const doc = await tx.doc(RepoWatchesDoc);
 
-                    if (doc.items[task.input.watchId]?.taskId === runtime.taskId) {
+                    if (!this.#app.sessionCleanup.isDeleting(runtime.conversationId) && doc.items[task.input.watchId]?.taskId === runtime.taskId) {
                         delete doc.items[task.input.watchId];
                     }
 
@@ -273,6 +274,7 @@ export class RepoWatches {
     /** Set up a watch for a person. Throws an HttpError a person (or PiP) can act on when it will not do. */
     async add(person: User, request: RepoWatchRequest): Promise<RepoWatchView> {
         const app = this.#app;
+        app.sessionCleanup.assertAvailable(request.target);
 
         if (!this.running) {
             throw new HttpError(409, "Triggers are turned off in Extensions.");
@@ -328,6 +330,7 @@ export class RepoWatches {
         const now = app.now();
 
         const watch = await app.harness.commit(async (tx) => {
+            app.sessionCleanup.assertAvailable(request.target);
             const doc = await tx.doc(RepoWatchesDoc);
             const same =
                 request.key === undefined
@@ -722,6 +725,7 @@ export class RepoWatches {
         }
 
         const target = watch.target as unknown as ConversationId;
+        app.sessionCleanup.assertAvailable(target);
         const person = app.config.userById(watch.by);
 
         if (person === undefined || person.role === "viewer" || !app.canSee(person, target)) {
@@ -838,5 +842,22 @@ export class RepoWatches {
 
             return { status: "running", checkpoint: { phase: "wait" } };
         }, context);
+    }
+
+    /** Native task abort stops polling; global watch records remain until the atomic purge callback. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        const scope = new Set(ids.map(Number));
+        for (const watch of await this.#all()) {
+            if (scope.has(watch.target)) this.#removing.add(watch.id);
+        }
+    }
+
+    finishSessionDeletion(): void {
+        for (const id of this.#removing) this.#sent.delete(id);
+        this.#removing.clear();
+    }
+
+    releaseSessionDeletion(): void {
+        this.#removing.clear();
     }
 }

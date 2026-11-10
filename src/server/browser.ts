@@ -33,6 +33,8 @@ export interface BrowsersOptions {
     args?: readonly string[];
     /** A conversation's saved address and size, to open its page again. */
     load?(conversationId: number): Promise<Saved | undefined>;
+    /** Native host guard, including deletion admission and persisted existence. */
+    assertAvailable?(conversationId: number): void;
     /** Called when a page's address or size changed. */
     save?(conversationId: number, saved: Saved): void;
     log?(line: string): void;
@@ -50,6 +52,8 @@ export class Browsers {
     #chromium: Promise<Chromium> | undefined;
     readonly #pages = new Map<number, BrowserPage>();
     readonly #opening = new Map<number, Promise<BrowserPage>>();
+    readonly #deleting = new Set<number>();
+    readonly #contexts = new Map<number, { chromium: Chromium; id: string }>();
     readonly #listeners = new Set<(conversationId: number, state: BrowserState) => void>();
     readonly #pending = new Map<number, NodeJS.Timeout>();
     readonly #problems = new Map<number, string>();
@@ -120,6 +124,7 @@ export class Browsers {
 
     /** Coalesce a page's changes: frames of logs and loads arrive in bursts. */
     #changed(conversationId: number): void {
+        if (this.#deleting.has(conversationId)) return;
         if (this.#pending.has(conversationId)) {
             return;
         }
@@ -226,6 +231,8 @@ export class Browsers {
      * has no saved size.
      */
     async open(conversationId: number, options: OpenOptions = {}): Promise<BrowserPage> {
+        this.#options.assertAvailable?.(conversationId);
+        if (this.#deleting.has(conversationId)) throw new BrowserError("This session is being deleted or was deleted.");
         if (this.#closing) {
             throw new BrowserError("The server is stopping.");
         }
@@ -265,7 +272,7 @@ export class Browsers {
 
     async #create(conversationId: number, options: OpenOptions): Promise<BrowserPage> {
         const generation = this.#generation;
-        const stale = () => this.#closing || this.#generation !== generation;
+        const stale = () => this.#closing || this.#generation !== generation || this.#deleting.has(conversationId);
         const saved = await this.#options.load?.(conversationId).catch(() => undefined);
 
         if (stale()) {
@@ -277,6 +284,7 @@ export class Browsers {
         const { browserContextId } = await connection.send("Target.createBrowserContext", {
             disposeOnDetach: false,
         });
+        this.#contexts.set(conversationId, { chromium, id: browserContextId });
         let page: BrowserPage | undefined;
 
         try {
@@ -302,7 +310,9 @@ export class Browsers {
                 viewport: viewportFrom(saved?.viewport) ??
                     options.viewport ?? { ...VIEWPORTS.desktop },
                 changed: () => this.#changed(conversationId),
-                saved: (value) => this.#options.save?.(conversationId, value),
+                saved: (value) => {
+                    if (!this.#deleting.has(conversationId)) this.#options.save?.(conversationId, value);
+                },
             });
             await page.init();
 
@@ -323,12 +333,17 @@ export class Browsers {
                 }
             }
 
+            if (stale()) throw new BrowserError("The browser was closed.");
+            this.#options.assertAvailable?.(conversationId);
             return page;
         } catch (error) {
             page?.close();
-            void connection
-                .send("Target.disposeBrowserContext", { browserContextId })
-                .catch(() => {});
+            try {
+                await connection.send("Target.disposeBrowserContext", { browserContextId });
+                this.#contexts.delete(conversationId);
+            } catch {
+                // Kept for a strict deletion retry: normal page failures still report the original error.
+            }
 
             throw error;
         }
@@ -360,7 +375,7 @@ export class Browsers {
 
         await chromium?.connection
             .send("Target.disposeBrowserContext", { browserContextId: page.contextId })
-            .catch(() => {});
+            .then(() => this.#contexts.delete(conversationId), () => {});
     }
 
     #reap(): void {
@@ -395,6 +410,9 @@ export class Browsers {
 
         chromium.kill();
         await Promise.race([chromium.exited, wait(4000)]);
+        for (const [id, owned] of this.#contexts) {
+            if (owned.chromium === chromium) this.#contexts.delete(id);
+        }
     }
 
     /** Close every page and stop the browser, as the server stops or the browser is turned off. */
@@ -430,5 +448,29 @@ export class Browsers {
                 this.#changed(id);
             }
         }
+    }
+
+    /** Close selected pages and in-flight openings, strictly disposing their private cookies/storage contexts. */
+    async prepareSessionDeletion(ids: readonly number[]): Promise<void> {
+        for (const id of ids) this.#deleting.add(id);
+        await Promise.all(ids.map((id) => this.#opening.get(id)?.catch(() => undefined)));
+        for (const id of ids) {
+            const page = this.#pages.get(id);
+            page?.close();
+            const owned = this.#contexts.get(id);
+            if (owned !== undefined) {
+                await owned.chromium.connection.send("Target.disposeBrowserContext", { browserContextId: owned.id });
+                this.#contexts.delete(id);
+            }
+            this.#pages.delete(id);
+            this.#problems.delete(id);
+            clearTimeout(this.#pending.get(id));
+            this.#pending.delete(id);
+        }
+    }
+
+    /** A rejected purge may reopen its pages; successful deletion keeps them permanently unavailable. */
+    releaseSessionDeletion(ids: readonly number[]): void {
+        for (const id of ids) this.#deleting.delete(id);
     }
 }

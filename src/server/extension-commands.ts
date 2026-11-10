@@ -93,9 +93,10 @@ function feedback(result: CommandResult): CommandResult & { clipped?: boolean } 
 export class ExtensionCommands {
     readonly #app: PocketApp;
     /** Handlers chosen for runs whose task has not started yet, by the run's `selection`. */
-    readonly #pending = new Map<string, { command: RegisteredCommand; by: string }>();
+    readonly #pending = new Map<string, { command: RegisteredCommand; by: string; conversation: ConversationId }>();
     /** Who started each handler still running, by task. */
     readonly #running = new Map<string, string>();
+    readonly #conversations = new Map<string, ConversationId>();
     readonly task: Task<CommandInput, { phase: "run" }, CommandOutcome, object>;
 
     constructor(app: PocketApp) {
@@ -128,6 +129,7 @@ export class ExtensionCommands {
                         } else {
                             await runtime.memo("started", true, context);
                             this.#running.set(String(task.id), task.input.by);
+                            this.#conversations.set(String(task.id), runtime.conversationId);
 
                             try {
                                 result = await this.#handle(picked.command, task.input, runtime);
@@ -139,6 +141,7 @@ export class ExtensionCommands {
                                 result = this.#failed(picked.command, error);
                             } finally {
                                 this.#running.delete(String(task.id));
+                                this.#conversations.delete(String(task.id));
                             }
                         }
 
@@ -205,6 +208,7 @@ export class ExtensionCommands {
         runtime: TaskRuntime<CommandInput, { phase: "run" }, CommandOutcome, object>,
     ): Promise<CommandOutcome> {
         const user = this.#app.config.userById(input.by);
+        this.#app.sessionCleanup.assertAvailable(runtime.conversationId);
 
         if (user === undefined) {
             throw new HttpError(403, "The person who ran this command no longer has access.");
@@ -233,7 +237,7 @@ export class ExtensionCommands {
                     },
                 }),
             ),
-            context,
+            withAbortSignal(runtime.signal, context),
         );
 
         return { ...feedback(answer), status: "done" };
@@ -298,6 +302,7 @@ export class ExtensionCommands {
         signal?: AbortSignal,
     ): Promise<CommandReceipt> {
         const app = this.#app;
+        app.sessionCleanup.assertAvailable(id);
 
         app.requireSee(user, id);
         app.requireSteer(user);
@@ -404,11 +409,12 @@ export class ExtensionCommands {
         const selection = randomUUID();
         let made = false;
 
-        this.#pending.set(selection, { command, by: user.id });
+        this.#pending.set(selection, { command, by: user.id, conversation: id });
 
         try {
             return await app.harness.commit(async (tx) => {
                 made = false;
+                app.sessionCleanup.assertAvailable(id);
                 const requests = await tx.doc(CommandRequestsDoc, id, user.id, null);
                 const known = requests.items[requestId];
 
@@ -499,5 +505,19 @@ export class ExtensionCommands {
         const input = task.input as CommandInput;
 
         return { name: input.command, scope: input.scope };
+    }
+
+    /** Native task abort already cancels bound handler signals and waits; discard only selected handler state. */
+    forgetSessions(ids: readonly ConversationId[]): void {
+        const scope = new Set(ids);
+        for (const [key, pending] of this.#pending) {
+            if (scope.has(pending.conversation)) this.#pending.delete(key);
+        }
+        for (const [task, id] of this.#conversations) {
+            if (scope.has(id)) {
+                this.#running.delete(task);
+                this.#conversations.delete(task);
+            }
+        }
     }
 }

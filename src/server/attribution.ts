@@ -15,7 +15,7 @@ import type {
 } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import { AuthorsDoc } from "./docs.ts";
-import { describe } from "./errors.ts";
+import { describe, HttpError } from "./errors.ts";
 import { requestPerson } from "./requests.ts";
 import type { Room } from "./room.ts";
 
@@ -51,12 +51,89 @@ export class Attribution {
      */
     readonly #lastAuthorEntry = new Map<ConversationId, number>();
     /** Who sent each submission, for queued messages. Filled from commits, or looked up once when missing. */
-    readonly #submitters = new Map<number, string>();
-    /** The submissions whose sender was looked up already, found or not. */
-    readonly #lookups = new Set<number>();
+    readonly #submitters = new Map<number, { conversationId: ConversationId; userId: string }>();
+    /** The submissions whose sender was looked up already, found or not, and their conversations. */
+    readonly #lookups = new Map<number, ConversationId>();
+    /** Author-document writes already admitted, drained before the native purge. */
+    readonly #writes = new Map<ConversationId, Set<Promise<void>>>();
 
     constructor(app: PocketApp) {
         this.#app = app;
+    }
+
+    #available(id: ConversationId): boolean {
+        try {
+            this.#app.sessionCleanup.assertAvailable(id);
+            return true;
+        } catch (error) {
+            if (error instanceof HttpError && (error.status === 409 || error.status === 404)) {
+                return false;
+            }
+
+            throw error;
+        }
+    }
+
+    #trackWrite(ids: readonly ConversationId[], pending: Promise<void>): Promise<void> {
+        const tracked = pending.finally(() => {
+            for (const id of ids) {
+                const writes = this.#writes.get(id);
+                writes?.delete(tracked);
+
+                if (writes?.size === 0) {
+                    this.#writes.delete(id);
+                }
+            }
+        });
+
+        for (const id of ids) {
+            const writes = this.#writes.get(id) ?? new Set<Promise<void>>();
+            writes.add(tracked);
+            this.#writes.set(id, writes);
+        }
+
+        return tracked;
+    }
+
+    /** The closure is sealed before this call: scheduled writes cannot start, admitted writes finish before purge. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        const writes = new Set<Promise<void>>();
+
+        for (const id of ids) {
+            for (const pending of this.#writes.get(id) ?? []) {
+                writes.add(pending);
+            }
+        }
+
+        await Promise.allSettled(writes);
+    }
+
+    /** Forget only the purged conversations' authors and queued-message identities. */
+    forgetSessions(ids: readonly ConversationId[]): void {
+        const selected = new Set(ids);
+
+        for (const id of ids) {
+            this.#lastAuthor.delete(id);
+            this.#lastAuthorEntry.delete(id);
+        }
+
+        for (const key of this.#authored) {
+            if (selected.has(Number(key.slice(0, key.indexOf(":"))) as unknown as ConversationId)) {
+                this.#authored.delete(key);
+            }
+        }
+
+        for (const [submission, identity] of this.#submitters) {
+            if (selected.has(identity.conversationId)) {
+                this.#submitters.delete(submission);
+            }
+        }
+
+        for (const [submission, id] of this.#lookups) {
+            if (selected.has(id)) {
+                this.#lookups.delete(submission);
+            }
+        }
     }
 
     /**
@@ -69,11 +146,19 @@ export class Attribution {
         authorsDoc:
             { entries: Record<string, string>; requesters?: Record<string, string> } | undefined,
     ): Promise<Missing[]> {
+        if (!this.#available(id)) {
+            return [];
+        }
+
         const known: Record<string, string> = {
             ...authorsDoc?.requesters,
             ...authorsDoc?.entries,
         };
         const missing = await this.#unrecordedAuthors(storage, id, known);
+
+        if (!this.#available(id)) {
+            return [];
+        }
 
         for (const { entry, userId } of missing) {
             known[String(entry)] = userId;
@@ -100,15 +185,23 @@ export class Attribution {
     /** Write what `recover` found missing into the authors documents, all in one commit. */
     async repair(unrecorded: ReadonlyMap<ConversationId, readonly Missing[]>): Promise<void> {
         if (unrecorded.size > 0) {
-            await this.#app.harness.commit(async (tx) => {
+            await this.#trackWrite([...unrecorded.keys()], this.#app.harness.commit(async (tx) => {
                 for (const [id, missing] of unrecorded) {
+                    if (!this.#available(id)) {
+                        continue;
+                    }
+
                     const doc = await tx.doc(AuthorsDoc, id);
+
+                    if (!this.#available(id)) {
+                        continue;
+                    }
 
                     for (const { entry, userId, wrote } of missing) {
                         noteAuthor(doc, entry, userId, wrote);
                     }
                 }
-            }, context);
+            }, context));
         }
     }
 
@@ -123,15 +216,19 @@ export class Attribution {
         wrote: boolean,
     ): void {
         setImmediate(() => {
-            this.#app.harness
-                .commit(
-                    async (tx) =>
-                        noteAuthor(await tx.doc(AuthorsDoc, conversationId), entry, userId, wrote),
-                    context,
-                )
-                .catch((error: unknown) =>
-                    this.#app.log(`author not recorded: ${describe(error)}`),
-                );
+            if (!this.#available(conversationId)) {
+                return;
+            }
+
+            this.#trackWrite([conversationId], this.#app.harness.commit(async (tx) => {
+                const doc = await tx.doc(AuthorsDoc, conversationId);
+
+                if (this.#available(conversationId)) {
+                    noteAuthor(doc, entry, userId, wrote);
+                }
+            }, context)).catch((error: unknown) =>
+                this.#app.log(`author not recorded: ${describe(error)}`),
+            );
         });
     }
 
@@ -155,6 +252,10 @@ export class Attribution {
                 context,
             );
 
+            if (!this.#available(id)) {
+                return [];
+            }
+
             for (const record of page.items) {
                 // Writes too: a `!` command Pi sees, or a note, is its person's (`shell.ts`, `Commands.note`).
                 const entry = record.entry;
@@ -177,10 +278,17 @@ export class Attribution {
 
     /** A message or write to Pi was placed or settled: who sent it, and whose work it is. */
     submissionCommitted(record: SubmissionRecord): void {
+        if (!this.#available(record.conversationId)) {
+            return;
+        }
+
         const person = requestPerson(record.requestId);
 
         if (person?.wrote === true) {
-            this.#submitters.set(record.id as unknown as number, person.userId);
+            this.#submitters.set(record.id as unknown as number, {
+                conversationId: record.conversationId,
+                userId: person.userId,
+            });
         }
 
         // A message's submission changes as it is placed and answered; its author is noted once, when it enters.
@@ -223,42 +331,56 @@ export class Attribution {
         const known = this.#submitters.get(submissionId);
 
         if (known !== undefined) {
-            return known;
+            return this.#available(known.conversationId) ? known.userId : undefined;
         }
 
         const submission = await this.#app.harness.submission(
             submissionId as unknown as SubmissionId,
             context,
         );
-        const person = requestPerson((await submission?.status(context))?.requestId);
+        const record = await submission?.status(context);
+        const person = requestPerson(record?.requestId);
 
-        if (person?.wrote !== true) {
+        if (record === undefined || !this.#available(record.conversationId) || person?.wrote !== true) {
             return undefined;
         }
 
-        this.#submitters.set(submissionId, person.userId);
+        this.#submitters.set(submissionId, {
+            conversationId: record.conversationId,
+            userId: person.userId,
+        });
 
         return person.userId;
     }
 
     /** Who queued a message: `{ by }` when known. Unknown ones (from before a restart) are looked up once. */
     submitterOf(submissionId: number, room: Room): { by?: string } {
+        if (!this.#available(room.id)) {
+            return {};
+        }
+
         const by = this.#submitters.get(submissionId);
 
         if (by !== undefined) {
-            return { by };
+            return this.#available(by.conversationId) ? { by: by.userId } : {};
         }
 
         if (!this.#lookups.has(submissionId)) {
-            this.#lookups.add(submissionId);
+            this.#lookups.set(submissionId, room.id);
             void this.#app.harness
                 .submission(submissionId as unknown as SubmissionId, context)
                 .then((submission) => submission?.status(context))
                 .then((record) => {
                     const person = requestPerson(record?.requestId);
 
-                    if (person?.wrote === true) {
-                        this.#submitters.set(submissionId, person.userId);
+                    if (
+                        record !== undefined && person?.wrote === true &&
+                        this.#available(room.id) && this.#available(record.conversationId)
+                    ) {
+                        this.#submitters.set(submissionId, {
+                            conversationId: record.conversationId,
+                            userId: person.userId,
+                        });
                         room.schedule();
                     }
                 })

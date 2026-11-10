@@ -7,7 +7,7 @@
 import { copyJson } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
-import { type ConversationId, UsageDoc, type UsageState } from "@earendil-works/pi-durable";
+import { type ConversationId, type Tx, UsageDoc, type UsageState } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
 import { SessionsDoc, SpendDoc } from "./docs.ts";
@@ -42,9 +42,91 @@ export class Spend {
     #timer: NodeJS.Timeout | undefined;
     /** Told when the owner changes a limit: work held back by one may go now. */
     readonly #limits = new Set<() => void>();
+    /** Counting and usage writes already admitted, drained before the native purge. */
+    readonly #writes = new Map<ConversationId, Set<Promise<void>>>();
 
     constructor(app: PocketApp) {
         this.#app = app;
+    }
+
+    #available(id: ConversationId): boolean {
+        try {
+            this.#app.sessionCleanup.assertAvailable(id);
+            return true;
+        } catch (error) {
+            if (error instanceof HttpError && (error.status === 409 || error.status === 404)) {
+                return false;
+            }
+
+            throw error;
+        }
+    }
+
+    #trackWrite(ids: readonly ConversationId[], pending: Promise<void>): Promise<void> {
+        const tracked = pending.finally(() => {
+            for (const id of ids) {
+                const writes = this.#writes.get(id);
+                writes?.delete(tracked);
+
+                if (writes?.size === 0) {
+                    this.#writes.delete(id);
+                }
+            }
+        });
+
+        for (const id of ids) {
+            const writes = this.#writes.get(id) ?? new Set<Promise<void>>();
+            writes.add(tracked);
+            this.#writes.set(id, writes);
+        }
+
+        return tracked;
+    }
+
+    /** Drain admitted accounting writes after sealing, so the purge owns the remaining selected debt. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        const writes = new Set<Promise<void>>();
+
+        for (const id of ids) {
+            // A newly created conversation may not have reported usage yet. Its native abort can still report cost.
+            if (!this.#costs.has(id)) {
+                this.#costs.set(id, 0);
+            }
+
+            for (const pending of this.#writes.get(id) ?? []) {
+                writes.add(pending);
+            }
+        }
+
+        await Promise.allSettled(writes);
+    }
+
+    /** In the native purge transaction, retain accrued people spend but remove selected counted identities. */
+    async pruneSessionDeletion(tx: Tx, ids: readonly ConversationId[]): Promise<void> {
+        const doc = await tx.doc(SpendDoc);
+
+        for (const id of new Set(ids)) {
+            for (const [payer, added] of this.#owed.get(id) ?? []) {
+                doc.people[payer] = (doc.people[payer] ?? 0) + added;
+            }
+
+            delete doc.counted[String(id)];
+        }
+        // Debt stays in memory until the purge commits: a failed transaction must not lose it.
+    }
+
+    /** After purge commits, drop only its conversation costs, pending debt, and stop markers. */
+    forgetSessions(ids: readonly ConversationId[]): void {
+        for (const id of ids) {
+            this.#costs.delete(id);
+            this.#owed.delete(id);
+            this.#stopping.delete(id);
+        }
+
+        if (this.#owed.size === 0) {
+            clearTimeout(this.#timer);
+            this.#timer = undefined;
+        }
     }
 
     /**
@@ -55,19 +137,29 @@ export class Spend {
         const harness = this.#app.harness;
 
         for (const id of ids) {
-            this.#costs.set(id, usageCost(await harness.snapshot(UsageDoc, id, context)));
+            if (!this.#available(id)) {
+                continue;
+            }
+
+            const cost = usageCost(await harness.snapshot(UsageDoc, id, context));
+
+            if (this.#available(id)) {
+                this.#costs.set(id, cost);
+            }
         }
 
         if ((await harness.snapshot(SpendDoc, context)) === undefined) {
             // The first start that counts spend per person: what was spent before is nobody's, rather than all of it
             // going to whoever wrote last in each conversation.
-            await harness.commit(async (tx) => {
+            await this.#trackWrite([...this.#costs.keys()], harness.commit(async (tx) => {
                 const doc = await tx.doc(SpendDoc);
 
                 for (const [id, cost] of this.#costs) {
-                    doc.counted[String(id)] = cost;
+                    if (this.#available(id)) {
+                        doc.counted[String(id)] = cost;
+                    }
                 }
-            }, context);
+            }, context));
         }
 
         const stored = await harness.snapshot(SpendDoc, context);
@@ -91,9 +183,34 @@ export class Spend {
 
     /** Add spend in a conversation to a person, to be stored with the next count. */
     #owe(id: ConversationId, payer: string, added: number): void {
+        if (!this.#acceptsUsage(id)) {
+            return;
+        }
+
         const owed = this.#owed.get(id) ?? new Map<string, number>();
 
         owed.set(payer, (owed.get(payer) ?? 0) + added);
+        this.#owed.set(id, owed);
+    }
+
+    #acceptsUsage(id: ConversationId): boolean {
+        // Final usage while stopping a sealed conversation still costs its people. Once forgotten, its absent cost
+        // cache also blocks late commit notifications during the remaining sealed post-purge window.
+        return this.#available(id) || (this.#app.sessionCleanup.isDeleting(id) && this.#costs.has(id));
+    }
+
+    /** A count sealed out by cleanup still owes its people, until the purge transaction pays them. */
+    #restoreOwed(id: ConversationId, payers: ReadonlyMap<string, number>): void {
+        if (!this.#acceptsUsage(id)) {
+            return;
+        }
+
+        const owed = this.#owed.get(id) ?? new Map<string, number>();
+
+        for (const [payer, added] of payers) {
+            owed.set(payer, (owed.get(payer) ?? 0) + added);
+        }
+
         this.#owed.set(id, owed);
     }
 
@@ -102,6 +219,10 @@ export class Spend {
      * work. Storing it waits for a moment.
      */
     usageChanged(id: ConversationId, usage: UsageState | null, alreadyPaid = false): void {
+        if (!this.#acceptsUsage(id)) {
+            return;
+        }
+
         const cost = usageCost(usage ?? undefined);
         // An auxiliary request pays all its usage in this commit. Do not infer another debt from rounded totals.
         const added = alreadyPaid ? 0 : cost - (this.#costs.get(id) ?? 0);
@@ -110,6 +231,10 @@ export class Spend {
 
         if (added > 0) {
             this.#owe(id, this.payer(id), added);
+        }
+
+        if (this.#app.sessionCleanup.isDeleting(id)) {
+            return;
         }
 
         this.#timer ??= setTimeout(() => {
@@ -131,8 +256,11 @@ export class Spend {
         payer: string,
         message: AssistantMessage,
     ): Promise<void> {
-        await this.#app.harness.commit(async (tx) => {
+        this.#app.sessionCleanup.assertAvailable(id);
+        await this.#trackWrite([id], this.#app.harness.commit(async (tx) => {
+            this.#app.sessionCleanup.assertAvailable(id);
             const models = (await tx.doc(UsageDoc, id)).models as Record<string, Usage>;
+            this.#app.sessionCleanup.assertAvailable(id);
             const key = `${message.provider}/${message.model}`;
             const usage = message.usage;
             const total = Object.hasOwn(models, key) ? models[key] : undefined;
@@ -172,10 +300,11 @@ export class Spend {
 
             // Atomic with usage: a restart cannot lose the payer or charge this request twice.
             const spend = await tx.doc(SpendDoc);
+            this.#app.sessionCleanup.assertAvailable(id);
 
             spend.counted[String(id)] = (spend.counted[String(id)] ?? 0) + usage.cost.total;
             spend.people[payer] = (spend.people[payer] ?? 0) + usage.cost.total;
-        }, context);
+        }, context));
         this.#stopOverLimit();
     }
 
@@ -190,39 +319,52 @@ export class Spend {
         );
     }
 
-    /** Store the spend added to people, then stop work that went past a limit. */
+    /** Store available conversations' spend; sealed debt is paid by the native purge instead. */
     async #count(): Promise<void> {
-        const owed = [...this.#owed];
-
-        this.#owed.clear();
+        const owed = [...this.#owed].filter(([id]) => this.#available(id));
 
         if (owed.length === 0) {
             return;
         }
 
-        try {
-            await this.#app.harness.commit(async (tx) => {
-                const doc = await tx.doc(SpendDoc);
-
-                for (const [id, payers] of owed) {
-                    for (const [payer, added] of payers) {
-                        doc.counted[String(id)] = (doc.counted[String(id)] ?? 0) + added;
-                        doc.people[payer] = (doc.people[payer] ?? 0) + added;
-                    }
-                }
-            }, context);
-        } catch (error) {
-            // Still owed: the next count stores it.
-            for (const [id, payers] of owed) {
-                for (const [payer, added] of payers) {
-                    this.#owe(id, payer, added);
-                }
-            }
-
-            throw error;
+        for (const [id] of owed) {
+            this.#owed.delete(id);
         }
 
-        this.#stopOverLimit();
+        await this.#trackWrite(owed.map(([id]) => id), (async () => {
+            const deferred = new Map<ConversationId, Map<string, number>>();
+
+            try {
+                await this.#app.harness.commit(async (tx) => {
+                    const doc = await tx.doc(SpendDoc);
+                    deferred.clear();
+
+                    for (const [id, payers] of owed) {
+                        if (!this.#available(id)) {
+                            deferred.set(id, payers);
+                            continue;
+                        }
+
+                        for (const [payer, added] of payers) {
+                            doc.counted[String(id)] = (doc.counted[String(id)] ?? 0) + added;
+                            doc.people[payer] = (doc.people[payer] ?? 0) + added;
+                        }
+                    }
+                }, context);
+            } catch (error) {
+                for (const [id, payers] of owed) {
+                    this.#restoreOwed(id, payers);
+                }
+
+                throw error;
+            }
+
+            for (const [id, payers] of deferred) {
+                this.#restoreOwed(id, payers);
+            }
+
+            this.#stopOverLimit();
+        })());
     }
 
     /** What one conversation spent, its subagents not counted: a subagent's own cost. */
@@ -381,7 +523,7 @@ export class Spend {
         const app = this.#app;
 
         for (const id of app.busyConversations()) {
-            if (this.#stopping.has(id)) {
+            if (!this.#available(id) || this.#stopping.has(id)) {
                 continue;
             }
 
@@ -395,10 +537,14 @@ export class Spend {
             app.notice("warning", `Pi stopped: ${why}.`, id);
             void app
                 .conversation(id)
-                .then((conversation) => conversation.abort(context))
+                .then((conversation) => this.#available(id) ? conversation.abort(context) : undefined)
                 .catch((error: unknown) => {
                     // The next count tries again.
                     this.#stopping.delete(id);
+                    if (!this.#available(id)) {
+                        return;
+                    }
+
                     app.log(`could not stop ${String(id)}: ${describe(error)}`);
                 });
         }
@@ -407,10 +553,12 @@ export class Spend {
     /** The owner limits what Pi may spend in a session (`null`: no limit). */
     async setSessionBudget(user: User, id: ConversationId, budget: unknown): Promise<void> {
         requireOwner(user);
+        this.#app.sessionCleanup.assertAvailable(id);
         const amount = budgetOf(budget);
 
-        await this.#app.harness.commit(async (tx) => {
+        await this.#trackWrite([id], this.#app.harness.commit(async (tx) => {
             const meta = (await tx.doc(SessionsDoc)).items[String(id)];
+            this.#app.sessionCleanup.assertAvailable(id);
 
             if (meta === undefined) {
                 throw new HttpError(404, "Not a session");
@@ -421,7 +569,7 @@ export class Spend {
             } else {
                 meta.budget = amount;
             }
-        }, context);
+        }, context));
         this.#limitsChanged();
         await this.#app.collab.activity(
             id,

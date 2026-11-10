@@ -4,7 +4,7 @@
  * end of the output, and keeps going, up to a number of checks. This module keeps the goal and runs the check.
  */
 import type { Context } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { ConversationId, TaskId } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import { type Goal, type GoalCheck, GoalDoc } from "./docs.ts";
@@ -28,6 +28,7 @@ const COUNTED = 50;
 
 export class Goals {
     readonly #app: PocketApp;
+    readonly #checks = new Map<ConversationId, Set<{ abort: AbortController; done: Promise<void> }>>();
 
     constructor(app: PocketApp) {
         this.#app = app;
@@ -44,6 +45,7 @@ export class Goals {
      */
     async set(id: ConversationId, by: string, command: string): Promise<Goal> {
         const app = this.#app;
+        app.sessionCleanup.assertAvailable(id);
         const check = command.trim();
 
         if (check === "") {
@@ -79,6 +81,7 @@ export class Goals {
         };
 
         await app.harness.commit(async (tx) => {
+            app.sessionCleanup.assertAvailable(id);
             (await tx.doc(GoalDoc, id)).goal = goal;
         }, context);
 
@@ -102,6 +105,7 @@ export class Goals {
 
     /** Whether Pi may take another round toward the goal: not past a spend limit. When not, the session is told why. */
     mayContinue(id: ConversationId): boolean {
+        if (this.#app.sessionCleanup.isDeleting(id)) return false;
         const why = this.#app.spend.heldBack(id);
 
         if (why !== undefined) {
@@ -117,16 +121,25 @@ export class Goals {
         command: string,
         context: Context,
     ): Promise<Omit<GoalCheck, "at">> {
+        this.#app.sessionCleanup.assertAvailable(id);
+        const abort = new AbortController();
+        const { promise: done, resolve: finished } = Promise.withResolvers<void>();
+        const active = { abort, done };
+        const checks = this.#checks.get(id) ?? new Set();
+        checks.add(active);
+        this.#checks.set(id, checks);
         let output = "";
-        const env = this.#app.envFor(id);
-        const result = await env.exec(
-            command,
-            {
+        let result;
+        try {
+            result = await this.#app.envFor(id).exec(command, {
                 timeout: CHECK_TIMEOUT_SECONDS,
                 onOutput: (text) => (output = (output + text).slice(-TAIL_CHARS)),
-            },
-            context,
-        );
+            }, withAbortSignal(abort.signal, context));
+        } finally {
+            checks.delete(active);
+            if (checks.size === 0) this.#checks.delete(id);
+            finished();
+        }
 
         if (!result.ok) {
             const why =
@@ -155,7 +168,9 @@ export class Goals {
         check: Omit<GoalCheck, "at">,
     ): Promise<Goal | undefined> {
         const app = this.#app;
+        app.sessionCleanup.assertAvailable(id);
         const goal = await app.harness.commit(async (tx) => {
+            app.sessionCleanup.assertAvailable(id);
             const doc = await tx.doc(GoalDoc, id);
             const goal = doc.goal;
 
@@ -194,5 +209,12 @@ export class Goals {
         }
 
         return goal;
+    }
+
+    /** Checks are external processes, not durable tasks: abort and await their execution before erasure. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        const checks = ids.flatMap((id) => [...(this.#checks.get(id) ?? [])]);
+        for (const check of checks) check.abort.abort(new Error("Session deleted."));
+        await Promise.all(checks.map((check) => check.done));
     }
 }

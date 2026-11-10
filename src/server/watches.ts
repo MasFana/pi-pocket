@@ -322,6 +322,7 @@ export class Watches {
         }
 
         const id = app.rootOf(asking);
+        app.sessionCleanup.assertAvailable(id);
         const meta = app.sessionMeta(id);
 
         if (meta === undefined || meta.pip !== undefined) {
@@ -473,6 +474,7 @@ export class Watches {
         const now = app.now();
 
         return app.harness.commit(async (tx) => {
+            app.sessionCleanup.assertAvailable(id);
             const doc = await tx.doc(WatchDoc, id);
             const current = doc.watch;
 

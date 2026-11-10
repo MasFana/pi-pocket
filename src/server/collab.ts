@@ -79,6 +79,36 @@ export class Collab {
         this.#app = app;
     }
 
+    /** Clear scoped typing timers before purge without opening any new room or emitting presence. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        await this.forgetSessions(ids);
+    }
+
+    /** Room owns typing state; closing only existing scoped rooms forgets it silently. */
+    async forgetSessions(ids: readonly ConversationId[]): Promise<void> {
+        await Promise.all(ids.map(async (id) => {
+            const pending = this.#app.openRoom(id);
+
+            if (pending !== undefined) {
+                const room = await pending.catch(() => undefined);
+                room?.close();
+            }
+        }));
+    }
+
+    #available(id: ConversationId): boolean {
+        try {
+            this.#app.sessionCleanup.assertAvailable(id);
+            return true;
+        } catch (error) {
+            if (error instanceof HttpError && (error.status === 404 || error.status === 409)) {
+                return false;
+            }
+
+            throw error;
+        }
+    }
+
     /** Post to the people's side chat of a conversation. Pi does not see it. */
     async postChat(
         id: ConversationId,
@@ -149,7 +179,11 @@ export class Collab {
         this.setTyping(id, user, null);
 
         if (created) {
-            void this.#chatPosted(id, user, message);
+            void this.#chatPosted(id, user, message).catch((error: unknown) => {
+                if (this.#available(id)) {
+                    app.log(`chat notification failed: ${describe(error)}`);
+                }
+            });
         }
 
         return message;
@@ -181,7 +215,17 @@ export class Collab {
     /** After a chat message: tell mentioned people wherever they are, and push to those away. */
     async #chatPosted(id: ConversationId, user: User, message: ChatMessage): Promise<void> {
         const app = this.#app;
+
+        if (!this.#available(id)) {
+            return;
+        }
+
         const title = await app.conversationTitle(app.rootOf(id));
+
+        if (!this.#available(id)) {
+            return;
+        }
+
         const mentioned = new Set(message.mentions ?? []);
 
         for (const client of app.clients) {
@@ -213,6 +257,10 @@ export class Collab {
         }
 
         for (const userId of await app.alerts.participants(id)) {
+            if (!this.#available(id)) {
+                return;
+            }
+
             if (userId === user.id || mentioned.has(userId)) {
                 continue;
             }
@@ -231,13 +279,29 @@ export class Collab {
      * learn who changed what; it never reaches Pi.
      */
     async activity(id: ConversationId, user: User, text: string, notify = true): Promise<void> {
+        if (!this.#available(id)) {
+            return;
+        }
+
         try {
             await this.#app.harness.commit(
-                async (tx) => addActivity(await tx.doc(ChatDoc, id), user, text),
+                async (tx) => {
+                    if (!this.#available(id)) {
+                        return;
+                    }
+
+                    const chat = await tx.doc(ChatDoc, id);
+
+                    if (this.#available(id)) {
+                        addActivity(chat, user, text);
+                    }
+                },
                 context,
             );
         } catch (error) {
-            this.#app.log(`activity not recorded: ${describe(error)}`);
+            if (this.#available(id)) {
+                this.#app.log(`activity not recorded: ${describe(error)}`);
+            }
         }
 
         if (notify) {
@@ -248,6 +312,10 @@ export class Collab {
     /** A notice for the people in a conversation, except whoever caused it. */
     #tell(id: ConversationId, except: string | undefined, message: string): void {
         const app = this.#app;
+
+        if (!this.#available(id)) {
+            return;
+        }
 
         for (const client of app.clients) {
             if (
@@ -262,6 +330,10 @@ export class Collab {
 
     /** Show others that this person is typing, in the chat or to Pi, or that they stopped. */
     setTyping(id: ConversationId, user: User, where: unknown): void {
+        if (!this.#available(id)) {
+            return;
+        }
+
         const place: TypingPlace | null =
             where === "chat" || (where === "pi" && user.role !== "viewer") ? where : null;
 
@@ -270,7 +342,11 @@ export class Collab {
         }
 
         void this.#app.openRoom(id)?.then(
-            (room) => room.setTyping(user.id, place),
+            (room) => {
+                if (this.#available(id) && this.#app.openRoom(id) !== undefined) {
+                    room.setTyping(user.id, place);
+                }
+            },
             () => {},
         );
     }

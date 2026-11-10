@@ -29,6 +29,7 @@ import {
     type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
+import type { ConversationId } from "@earendil-works/pi-durable";
 import { classify, type ResponseFacts, responseFacts, type Scope, type Source } from "./limits.ts";
 
 /** The adapters that send their requests through `options.fetch`, so the status and headers of a failure can be seen. */
@@ -115,6 +116,8 @@ type Waiter = {
     provider: string;
     modelId: string;
     signal?: AbortSignal | undefined;
+    controller: AbortController;
+    conversation: Promise<number | undefined>;
     /** When this waiter may leave, after the gate opened. */
     releaseAt?: number;
     /** Ends the waiter's nap now. */
@@ -171,6 +174,8 @@ export type GateDeps = {
     epoch: (provider: string) => number;
     /** The conversation whose generation makes a request with this session id, if it is known. */
     conversationOf: (sessionId: string) => Promise<number | undefined> | number | undefined;
+    /** The app's central deletion seal, checked after resolving the runtime session. */
+    isSessionAvailable?: (conversationId: number) => boolean;
     /** A wait began, changed, or ended: tell the tabs. */
     changed: () => void;
     /** A wait of `longWaitMs` or more began for this conversation. */
@@ -285,6 +290,7 @@ export class LimitGate {
     readonly #deps: GateDeps;
     readonly #tuning: LimitTuning;
     readonly #gates = new Map<string, Gate>();
+    readonly #requests = new Map<Waiter, Promise<void>>();
     readonly #now: () => number;
     readonly #random: () => number;
 
@@ -317,6 +323,49 @@ export class LimitGate {
 
             return this.#stream(underlying, model, context, options);
         };
+    }
+
+    /** Cancel scoped requests before purge, including canaries and waiters whose lookup is still pending. */
+    async prepareSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        await this.forgetSessions(ids);
+    }
+
+    /** Leave shared provider gates intact and drain only requests belonging to the purged sessions. */
+    async forgetSessions(ids: readonly ConversationId[]): Promise<void> {
+        const selected = new Set(ids.map((id) => id as unknown as number));
+        const pending: Promise<void>[] = [];
+
+        for (const [waiter, request] of this.#requests) {
+            const cancel = (conversationId: number | undefined): Promise<void> | undefined => {
+                if (conversationId === undefined || !selected.has(conversationId)) {
+                    return undefined;
+                }
+
+                waiter.controller.abort();
+                waiter.poke?.();
+                this.#leave(waiter);
+                delete waiter.releaseAt;
+
+                return request;
+            };
+
+            if (waiter.conversationId !== undefined) {
+                const done = cancel(waiter.conversationId);
+
+                if (done !== undefined) {
+                    pending.push(done);
+                }
+            } else {
+                pending.push(waiter.conversation.then(cancel));
+            }
+        }
+
+        await Promise.all(pending);
+    }
+
+    #available(waiter: Waiter): boolean {
+        return waiter.conversationId === undefined ||
+            this.#deps.isSessionAvailable?.(waiter.conversationId) !== false;
     }
 
     /** The wait a conversation's run is in, if it is in one (not one a gate refuses). */
@@ -457,13 +506,33 @@ export class LimitGate {
         options: SimpleStreamOptions | undefined,
     ): AssistantMessageEventStream {
         const out = createAssistantMessageEventStream();
+        const controller = new AbortController();
+        const signal = options?.signal === undefined
+            ? controller.signal
+            : AbortSignal.any([options.signal, controller.signal]);
+        const sessionId = options?.sessionId;
+        const waiter: Waiter = {
+            ...(sessionId === undefined ? {} : { sessionId }),
+            provider: model.provider,
+            modelId: model.id,
+            signal,
+            controller,
+            conversation: sessionId === undefined
+                ? Promise.resolve(undefined)
+                : Promise.resolve().then(() => this.#deps.conversationOf(sessionId)).catch(() => undefined),
+            told: false,
+            tries: 0,
+        };
 
-        void this.#run(underlying, model, context, options, out).catch((error: unknown) => {
+        const request = this.#run(underlying, model, context, { ...options, signal }, out, waiter).catch((error: unknown) => {
             const message = failure(model, this.#now(), "error", String(error));
 
             out.push({ type: "error", reason: "error", error: message });
             out.end(message);
         });
+
+        this.#requests.set(waiter, request);
+        void request.finally(() => this.#requests.delete(waiter));
 
         return out;
     }
@@ -474,17 +543,10 @@ export class LimitGate {
         context: TranscriptContext,
         options: SimpleStreamOptions | undefined,
         out: AssistantMessageEventStream,
+        waiter: Waiter,
     ): Promise<void> {
-        const signal = options?.signal;
+        const signal = waiter.signal;
         const started = this.#now();
-        const waiter: Waiter = {
-            ...(options?.sessionId === undefined ? {} : { sessionId: options.sessionId }),
-            provider: model.provider,
-            modelId: model.id,
-            signal,
-            told: false,
-            tries: 0,
-        };
 
         const end = (message: AssistantMessage) => {
             out.push(
@@ -496,8 +558,15 @@ export class LimitGate {
         };
 
         try {
+            const conversationId = await waiter.conversation;
+
+            if (conversationId !== undefined) {
+                waiter.conversationId = conversationId;
+            }
+
             for (;;) {
-                if (isAborted(signal)) {
+                if (!this.#available(waiter) || isAborted(signal)) {
+                    waiter.controller.abort();
                     return end(failure(model, started, "aborted", "Request was aborted"));
                 }
 
@@ -531,12 +600,27 @@ export class LimitGate {
                     context,
                     options,
                     out,
+                    waiter,
                     () => {
                         if (canary !== undefined) {
+                            if (!this.#available(waiter) || isAborted(signal)) {
+                                return;
+                            }
+
                             this.#open(canary, true);
                         }
                     },
                 );
+
+                if (!this.#available(waiter) || isAborted(signal)) {
+                    waiter.controller.abort();
+
+                    if (attempt.type !== "done") {
+                        end(failure(model, started, "aborted", "Request was aborted"));
+                    }
+
+                    return;
+                }
 
                 // However the attempt ended, the gate its request held as canary is settled by now or by `#leave`: none
                 // stays probing with a canary that cannot finish it.
@@ -596,6 +680,7 @@ export class LimitGate {
         context: TranscriptContext,
         options: SimpleStreamOptions | undefined,
         out: AssistantMessageEventStream,
+        waiter: Waiter,
         onContent: () => void,
     ): Promise<
         | { type: "done"; content: boolean }
@@ -629,6 +714,13 @@ export class LimitGate {
 
         try {
             for await (const event of stream) {
+                if (!this.#available(waiter) || isAborted(waiter.signal)) {
+                    waiter.controller.abort();
+                    terminal = failure(model, this.#now(), "aborted", "Request was aborted");
+                    out.push({ type: "error", reason: "aborted", error: terminal });
+                    break;
+                }
+
                 if (event.type === "error") {
                     terminal = event.error;
 
@@ -1137,34 +1229,19 @@ export class LimitGate {
         this.#deps.changed();
     }
 
-    /** Find the conversation of a waiting request, once, and tell the people of a long wait. */
+    /** Tell the people of a long wait only while its resolved session remains available. */
     #tell(gate: Gate, waiter: Waiter): void {
         this.#deps.changed();
 
-        if (waiter.told || waiter.sessionId === undefined) {
+        if (waiter.told || waiter.conversationId === undefined || !this.#available(waiter) || isAborted(waiter.signal)) {
             return;
         }
 
         waiter.told = true;
 
-        void Promise.resolve(this.#deps.conversationOf(waiter.sessionId)).then(
-            (conversationId) => {
-                if (conversationId === undefined) {
-                    return;
-                }
-
-                waiter.conversationId = conversationId;
-                this.#deps.changed();
-
-                if (
-                    gate.until - this.#now() >= this.#tuning.longWaitMs &&
-                    gate.waiters.has(waiter)
-                ) {
-                    this.#deps.started?.(conversationId, this.#view(gate));
-                }
-            },
-            () => {},
-        );
+        if (gate.until - this.#now() >= this.#tuning.longWaitMs && gate.waiters.has(waiter)) {
+            this.#deps.started?.(waiter.conversationId, this.#view(gate));
+        }
     }
 
     #view(gate: Gate): WaitView {

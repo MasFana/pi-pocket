@@ -343,6 +343,8 @@ export interface AppEvents {
      * @experimental
      */
     "session.archived": { conversationId: number; archived: boolean };
+    /** Native conversations removed after their committed purge; excludes unrelated linked/forked roots. @experimental */
+    "session.deleted": { conversationIds: readonly number[] };
     /**
      * A person sent Pi a message: its words as stored, attachments left out. `via` names what sent it for them.
      * @since 0.22.0
@@ -1065,6 +1067,34 @@ export type WebAccess = "owner" | "steer" | "view";
  */
 export type WebMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
+/** Native session-tree deletion preview. Requires the custom session-cleanup runtime. @experimental */
+export interface SessionDeletionPreview {
+    readonly ids: number[];
+    readonly revision: string;
+    readonly roots: { readonly id: number; readonly title: string; readonly cwd: string }[];
+    readonly conversations: number;
+    readonly subagents: number;
+    readonly tasks: number;
+    readonly submissions: number;
+    readonly documents: number;
+    readonly entries: number;
+    readonly retainedSharedEntries: number;
+}
+
+/** Actual native purge receipt; shared history and project files are not claimed erased. @experimental */
+export interface SessionDeletionOutcome {
+    readonly status: "deleted" | "already_deleted";
+    readonly ids: number[];
+    readonly conversations: number;
+    readonly subagents: number;
+    readonly tasks: number;
+    readonly submissions: number;
+    readonly documents: number;
+    readonly entries: number;
+    readonly retainedSharedEntries: number;
+    readonly warnings: string[];
+}
+
 /**
  * A request to a route, as its handler gets it.
  * @since 0.14.0
@@ -1076,6 +1106,10 @@ export interface WebRequest {
      * @experimental
      */
     createSession(request: { cwd: string; title?: string }): Promise<{ id: number }>;
+    /** Preview only; requires owner access and the custom native cleanup runtime. @experimental */
+    planSessionDeletion(ids: readonly number[]): Promise<SessionDeletionPreview>;
+    /** Purge roots and their true subagents using a stable request ID. @experimental */
+    deleteSessions(request: { ids: readonly number[]; revision?: string; requestId: string }): Promise<SessionDeletionOutcome>;
     /**
      * The request's method.
      * @since 0.14.0

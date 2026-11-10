@@ -18,6 +18,8 @@ export interface AppEvents {
     };
     "session.renamed": { conversationId: number; title: string };
     "session.archived": { conversationId: number; archived: boolean };
+    /** A native root and its owned subagents were purged; emitted only after storage committed. */
+    "session.deleted": { conversationIds: readonly number[] };
     /**
      * A person sent Pi a message (also a steer or a queued one): who, and its words as stored (hidden values hidden,
      * attachments left out). `via` names what sent it for them: PiP, a schedule, a webhook.
@@ -50,6 +52,7 @@ export const APP_EVENTS: readonly AppEventName[] = [
     "session.created",
     "session.renamed",
     "session.archived",
+    "session.deleted",
     "message.sent",
     "run.started",
     "run.ended",

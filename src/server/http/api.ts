@@ -2,6 +2,8 @@
  * `/api`: the routes the web app calls. Each needs a signed-in person, and each but a GET needs the `X-Pocket` header,
  * which a form on another site cannot send. A conversation's routes are in `conversation-routes.ts`.
  */
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
+import type { Context } from "@earendil-works/chord";
 import { readdirSync, statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir, networkInterfaces } from "node:os";
@@ -39,6 +41,7 @@ import {
     readJson,
 } from "./io.ts";
 import { pushRoutes } from "./push-routes.ts";
+import type { SessionDeletionOutcome, SessionDeletionPreview } from "../session-cleanup.ts";
 
 /** This machine's non-internal IPv4 addresses, for invite links other devices on its networks can open. */
 function lanAddresses(): string[] {
@@ -67,6 +70,24 @@ export function createApi(options: HttpOptions, auth: Auth) {
         if (user.role !== "owner") {
             throw new HttpError(403, "Only the owner can do that");
         }
+    };
+
+    const cleanupIds = (value: unknown): number[] => {
+        if (!Array.isArray(value) || !value.every((id) => typeof id === "number" && Number.isSafeInteger(id))) {
+            throw new HttpError(400, "ids must be a list of integer session IDs");
+        }
+        return value;
+    };
+
+    const cleanupRequest = async (
+        response: ServerResponse,
+        action: (context: Context) => Promise<SessionDeletionOutcome | SessionDeletionPreview>,
+    ): Promise<SessionDeletionOutcome | SessionDeletionPreview> => {
+        const stopped = new AbortController();
+        const close = () => stopped.abort(new HttpError(409, "The session cleanup request disconnected."));
+        response.once("close", close);
+        try { return await action(withAbortSignal(stopped.signal, BACKGROUND_CONTEXT)); }
+        finally { response.off("close", close); }
     };
 
     /**
@@ -148,6 +169,26 @@ export function createApi(options: HttpOptions, auth: Auth) {
 
         const [first, second, third, fourth] = parts;
         const route: ApiRequest = { app, request, response, url, user };
+
+        if (first === "session-cleanup" && method === "POST") {
+            requireOwner(user);
+            const body = await readJson<Record<string, unknown>>(request);
+            const preview = second === "preview" && third === undefined;
+            if (!preview && second !== undefined) throw new HttpError(404, "Unknown session cleanup route");
+            const allowed = new Set(preview ? ["ids"] : ["ids", "revision", "requestId"]);
+            if (Object.keys(body).some((key) => !allowed.has(key))) throw new HttpError(400, "Unknown session cleanup field");
+            const ids = cleanupIds(body.ids);
+            if (preview) {
+                return json(response, 200, await cleanupRequest(response, (context) => app.sessionCleanup.plan(user, ids, context)));
+            }
+            if (typeof body.requestId !== "string" || (body.revision !== undefined && typeof body.revision !== "string")) {
+                throw new HttpError(400, "requestId must be a string and revision, when supplied, must be a string");
+            }
+            const requestId = body.requestId, revision = body.revision;
+            return json(response, 200, await cleanupRequest(response, (context) => app.sessionCleanup.delete(user, {
+                ids, requestId, ...(revision === undefined ? {} : { revision }),
+            }, context)));
+        }
 
         if (first === "events" && method === "GET") {
             return events(request, response, url, user);

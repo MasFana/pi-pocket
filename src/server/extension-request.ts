@@ -8,6 +8,7 @@ import { TurnsDoc } from "./docs.ts";
 import { HttpError } from "./errors.ts";
 import { mayUse } from "./extension-web.ts";
 import type { WebAccess, WebRequest } from "./host.ts";
+import type { SessionDeletionOutcome, SessionDeletionPreview } from "./session-cleanup.ts";
 
 /** Internal only: no extension can select an actor through the public host. */
 export interface RequestActor {
@@ -52,6 +53,18 @@ export class ExtensionRequest implements RequestActor {
             ...(request.title === undefined ? {} : { title: request.title }),
         });
     }
+    async planSessionDeletion(ids: readonly number[]): Promise<SessionDeletionPreview> {
+        const user = this.current();
+        if (this.#access !== "owner" || user.role !== "owner") throw new HttpError(403, "Only the owner can delete sessions.");
+        return this.#app.sessionCleanup.plan(user, ids, this.context);
+    }
+
+    async deleteSessions(request: { ids: readonly number[]; revision?: string; requestId: string }): Promise<SessionDeletionOutcome> {
+        const user = this.current();
+        if (this.#access !== "owner" || user.role !== "owner") throw new HttpError(403, "Only the owner can delete sessions.");
+        return this.#app.sessionCleanup.delete(user, request, this.context);
+    }
+
 
     close = (): void => {
         this.#stopped.abort(new HttpError(409, "This extension request has ended."));

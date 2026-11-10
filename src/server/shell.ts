@@ -75,6 +75,7 @@ export class Shell {
     readonly task: Task<ShellInput, { phase: "run" }, null, object>;
     /** What each running command printed so far, so a stopped one keeps it. Lost with a restart, as the command is. */
     readonly #tails = new Map<number, { output: string; clipped: boolean }>();
+    readonly #conversations = new Map<number, ConversationId>();
 
     constructor(app: PocketApp) {
         this.#app = app;
@@ -85,6 +86,7 @@ export class Shell {
             phases: {
                 run: async (task, runtime, context) => {
                     const taskId = Number(task.id);
+                    this.#conversations.set(taskId, runtime.conversationId);
                     // Set before the command starts: finding it set means a restart cut the command off.
                     const started = await runtime.memo<number>("started", context);
                     let data: ShellData;
@@ -107,6 +109,7 @@ export class Shell {
 
                     await this.#record(runtime.conversationId, data, context);
                     this.#tails.delete(taskId);
+                    this.#conversations.delete(taskId);
                     await runtime.commit(() => finished, context);
                 },
             },
@@ -116,6 +119,7 @@ export class Shell {
                 const tail = this.#tails.get(taskId);
 
                 this.#tails.delete(taskId);
+                this.#conversations.delete(taskId);
                 await this.#record(
                     runtime.conversationId,
                     {
@@ -241,6 +245,7 @@ export class Shell {
         request: { command?: unknown; context?: unknown; requestId?: unknown },
     ): Promise<{ taskId: number }> {
         const app = this.#app;
+        app.sessionCleanup.assertAvailable(id);
 
         app.requireSee(user, id);
         await app.requireDriver(id, user);
@@ -287,6 +292,7 @@ export class Shell {
                 ? `${user.id}:${request.requestId.slice(0, 64)}`
                 : undefined;
         const taskId = await app.harness.commit(async (tx) => {
+            app.sessionCleanup.assertAvailable(id);
             const requests = await tx.doc(ShellRequestsDoc, id);
             const known = key === undefined ? undefined : requests.items[key];
 
@@ -365,5 +371,16 @@ export class Shell {
         const task = await this.#app.harness.getTask(taskId, BACKGROUND_CONTEXT);
 
         return task?.kind === TASK ? (task.input as ShellInput).command : undefined;
+    }
+
+    /** Called after native background-inclusive task abort and purge. */
+    forgetSessions(ids: readonly ConversationId[]): void {
+        const scope = new Set(ids);
+        for (const [task, conversation] of this.#conversations) {
+            if (scope.has(conversation)) {
+                this.#tails.delete(task);
+                this.#conversations.delete(task);
+            }
+        }
     }
 }

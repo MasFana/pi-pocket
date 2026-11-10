@@ -110,6 +110,7 @@ import { Hooks } from "./hooks.ts";
 import { Pip, PIP_EXTENSION } from "./pip.ts";
 import { PIP_COMPACT_CHOICES, PipCompaction } from "./pip-compact.ts";
 import { RepoWatches } from "./repo-watches.ts";
+import { SessionCleanup } from "./session-cleanup.ts";
 import { snippet } from "./projection.ts";
 import { loadPromptTemplates, type PromptTemplate, type SkillCommand } from "./prompts.ts";
 import { BASE_THEME, Themes } from "./themes.ts";
@@ -393,6 +394,8 @@ export class PocketApp {
     readonly extensionCommands = new ExtensionCommands(this);
     readonly linkedSessions = new LinkedSessions(this);
     readonly extensionSessions = new ExtensionSessions(this);
+    /** Owner-only native cascade removal; storage and runtime retain the lifecycle. */
+    readonly sessionCleanup = new SessionCleanup(this);
     readonly collab = new Collab(this);
     readonly alerts = new Alerts(this);
     readonly providers = new Providers(this);
@@ -437,8 +440,9 @@ export class PocketApp {
     /** What happens in the app, for extensions (`app-events.ts`, `host.on`). */
     readonly events = new AppEventBus((line) => this.#log(line));
     /** Values extensions hide from what commands and tools give back (`hidden.ts`, `host.hide`). */
-    readonly hidden = new HiddenValues((id) =>
-        Number(this.rootOf(id as unknown as ConversationId)),
+    readonly hidden = new HiddenValues(
+        (id) => Number(this.rootOf(id as unknown as ConversationId)),
+        (id) => this.sessionCleanup.assertAvailable(id as unknown as ConversationId),
     );
     /** What extensions add to the environment of each command (`hidden.ts`, `host.commandEnv`). */
     readonly commandEnvs = new CommandEnvs((line) => this.#log(line));
@@ -565,6 +569,13 @@ export class PocketApp {
             hours: () => this.config.limitWaitHours,
             epoch: (provider) => this.providers.signInEpoch(provider),
             conversationOf: (sessionId) => this.#conversationOfSession(sessionId),
+            isSessionAvailable: (id) => {
+                try { this.sessionCleanup.assertAvailable(id as unknown as ConversationId); return true; }
+                catch (error) {
+                    if (error instanceof HttpError && (error.status === 404 || error.status === 409)) return false;
+                    throw error;
+                }
+            },
             changed: () => this.#limitsChanged(),
             started: (conversationId, view) => this.alerts.limitWait(conversationId, view),
             log: (line) => this.#log(line),
@@ -573,6 +584,7 @@ export class PocketApp {
         });
         this.browsers = new Browsers({
             dataDir: options.dataDir,
+            assertAvailable: (id) => this.sessionCleanup.assertAvailable(id as unknown as ConversationId),
             ...(options.browser === undefined ? {} : { executable: options.browser }),
             log: (line) => this.#log(line),
             load: async (id) =>
@@ -1596,6 +1608,7 @@ export class PocketApp {
 
     /** Where a conversation's commands run: its folder here, or its workspace provider's env. */
     envFor(id: ConversationId): ExecutionEnv {
+        this.sessionCleanup.assertAvailable(id);
         return this.#wrapped(id, this.cwdOf(id));
     }
 
@@ -2339,8 +2352,10 @@ export class PocketApp {
 
     /** While take turns is on, only the driver sends to Pi or changes its settings. */
     async requireDriver(id: ConversationId, user: User): Promise<void> {
+        this.sessionCleanup.assertAvailable(id);
         this.requireSteer(user);
         const turns = await this.harness.snapshot(TurnsDoc, this.rootOf(id), context);
+        this.sessionCleanup.assertAvailable(id);
 
         if (turns?.on !== true || turns.driver === user.id) {
             return;
@@ -2532,6 +2547,7 @@ export class PocketApp {
 
     /** A conversation's shared view, opened when no tab has it open. Hand it to `releaseRoom` when done with it. */
     async room(id: ConversationId): Promise<Room> {
+        this.sessionCleanup.assertAvailable(id);
         let pending = this.#rooms.get(id);
 
         if (pending === undefined) {
@@ -2545,6 +2561,8 @@ export class PocketApp {
                 const room = new Room(this, id);
 
                 await room.open(conversation);
+                try { this.sessionCleanup.assertAvailable(id); }
+                catch (error) { room.close(); throw error; }
 
                 return room;
             })();
@@ -3035,6 +3053,7 @@ export class PocketApp {
 
     /** A conversation's handle; 404 when it does not exist. */
     async conversation(id: ConversationId): Promise<Conversation> {
+        this.sessionCleanup.assertAvailable(id);
         const conversation = await this.harness.conversation(id, context);
 
         if (conversation === undefined) {
@@ -3042,6 +3061,45 @@ export class PocketApp {
         }
 
         return conversation;
+    }
+
+    /** Forget only committed deleted scopes, after the native writer has published their purge. */
+    async finishSessionDeletion(ids: readonly ConversationId[]): Promise<void> {
+        const selected = new Set(ids);
+        for (const client of this.#clients) {
+            if (client.conversationId !== undefined && selected.has(client.conversationId)) {
+                this.#evict(client, "This session was deleted.");
+            }
+            for (const id of client.peeks ?? []) {
+                if (!selected.has(id)) continue;
+                client.peeks?.delete(id);
+                this.#unpeek(client, id);
+            }
+            client.sessionsSent = undefined;
+            client.boardSent = undefined;
+        }
+        const rooms: Promise<void>[] = [];
+        for (const id of ids) {
+            const pending = this.#rooms.get(id);
+            this.#rooms.delete(id);
+            if (pending) rooms.push(pending.then((room) => room.close()));
+            this.#agents.delete(id);
+            this.#parents.delete(id);
+            this.#subagents.delete(id);
+            this.#busy.delete(id);
+            this.#compacting.delete(id);
+            this.#endedAt.delete(id);
+            this.#failed.delete(id);
+            this.#background.delete(id);
+            this.#lastChat.delete(String(id));
+            this.#limitWaiting.delete(Number(id));
+        }
+        const ended = await Promise.allSettled(rooms);
+        this.#scheduleSessions();
+        this.events.emit("session.deleted", { conversationIds: ids.map(Number) });
+        if (ended.some((room) => room.status === "rejected")) {
+            throw new Error("Session data was deleted; one pending session view could not finish closing.");
+        }
     }
 
     /**
