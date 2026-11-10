@@ -29,7 +29,7 @@ import type { CommandEnvProvider, HiddenValue } from "./hidden.ts";
 import type { AppEventName, AppEvents } from "./app-events.ts";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import type { SettingField, SettingValue } from "./extension-settings.ts";
-import type { SessionDeletionOutcome, SessionDeletionPreview } from "./session-cleanup.ts";
+import type { SessionDeletionOutcome, SessionDeletionPreview, SessionSubagentRow } from "./session-cleanup.ts";
 
 export type { SettingField, SettingValue } from "./extension-settings.ts";
 
@@ -622,6 +622,8 @@ export type WebMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 export interface WebRequest {
     /** @experimental @since 0.28.0 */
     createSession(request: { cwd: string; title?: string }): Promise<{ id: number }>;
+    /** Known subagents for the owner's cleanup tree; the preview closure decides what is deleted. @experimental */
+    subagentTree(): SessionSubagentRow[];
     /** Owner-only native cleanup; requires a session-cleanup-capable Pocket runtime. @experimental */
     planSessionDeletion(ids: readonly number[]): Promise<SessionDeletionPreview>;
     /** Delete roots and all native-owned subagents; a stable requestId reconciles a completed retry. @experimental */

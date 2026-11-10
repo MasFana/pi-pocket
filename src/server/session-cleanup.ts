@@ -45,6 +45,15 @@ export type SessionDeletionOutcome = {
     warnings: string[];
 };
 
+/** One known subagent, for the owner's cleanup tree. Display only: the preview closure stays authoritative. */
+export type SessionSubagentRow = {
+    conversationId: number;
+    parentId: number | null;
+    rootId: number;
+    name: string;
+    busy: boolean;
+};
+
 type Receipt = {
     actor: string;
     requestId: string;
@@ -168,6 +177,24 @@ export class SessionCleanup {
         }, context);
         this.#owner(user);
         return roots;
+    }
+
+    /**
+     * The subagents the app knows, for the cleanup tree. A subagent that ended long ago and is no longer listed here is
+     * still part of its session's native closure, so this never decides what is deleted; the preview does.
+     */
+    subagents(user: User): SessionSubagentRow[] {
+        this.#owner(user);
+        return this.#app.subagents(user).map((entry) => {
+            const parent = this.#app.parentOf(entry.conversationId);
+            return {
+                conversationId: Number(entry.conversationId),
+                parentId: parent === undefined ? null : Number(parent),
+                rootId: entry.id,
+                name: entry.name,
+                busy: entry.busy === true,
+            };
+        }).sort((a, b) => a.conversationId - b.conversationId);
     }
 
     #cap(plan: ConversationDeletionPlan): void {

@@ -129,6 +129,7 @@ export async function extensionRoute(
             createSession: (request: { cwd: string; title?: string }) =>
                 scope.createSession(request),
             planSessionDeletion: (ids: readonly number[]) => scope.planSessionDeletion(ids),
+            subagentTree: () => scope.subagentTree(),
             deleteSessions: (request: { ids: readonly number[]; revision?: string; requestId: string }) => scope.deleteSessions(request),
             // Read when the handler asks, as the person is then: a copy, so the handler cannot change the list.
             sessions: (): WebSession[] =>

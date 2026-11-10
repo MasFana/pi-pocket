@@ -1067,6 +1067,15 @@ export type WebAccess = "owner" | "steer" | "view";
  */
 export type WebMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
+/** A subagent the app knows, for the owner's cleanup tree. Display only; the preview closure decides deletion. @experimental */
+export interface SessionSubagentRow {
+    readonly conversationId: number;
+    readonly parentId: number | null;
+    readonly rootId: number;
+    readonly name: string;
+    readonly busy: boolean;
+}
+
 /** Native session-tree deletion preview. Requires the custom session-cleanup runtime. @experimental */
 export interface SessionDeletionPreview {
     readonly ids: number[];
@@ -1106,6 +1115,8 @@ export interface WebRequest {
      * @experimental
      */
     createSession(request: { cwd: string; title?: string }): Promise<{ id: number }>;
+    /** Known subagents for the owner's cleanup tree. @experimental */
+    subagentTree(): SessionSubagentRow[];
     /** Preview only; requires owner access and the custom native cleanup runtime. @experimental */
     planSessionDeletion(ids: readonly number[]): Promise<SessionDeletionPreview>;
     /** Purge roots and their true subagents using a stable request ID. @experimental */

@@ -8,7 +8,7 @@ import { TurnsDoc } from "./docs.ts";
 import { HttpError } from "./errors.ts";
 import { mayUse } from "./extension-web.ts";
 import type { WebAccess, WebRequest } from "./host.ts";
-import type { SessionDeletionOutcome, SessionDeletionPreview } from "./session-cleanup.ts";
+import type { SessionDeletionOutcome, SessionDeletionPreview, SessionSubagentRow } from "./session-cleanup.ts";
 
 /** Internal only: no extension can select an actor through the public host. */
 export interface RequestActor {
@@ -53,6 +53,12 @@ export class ExtensionRequest implements RequestActor {
             ...(request.title === undefined ? {} : { title: request.title }),
         });
     }
+    subagentTree(): SessionSubagentRow[] {
+        const user = this.current();
+        if (this.#access !== "owner" || user.role !== "owner") throw new HttpError(403, "Only the owner can list sessions for cleanup.");
+        return this.#app.sessionCleanup.subagents(user);
+    }
+
     async planSessionDeletion(ids: readonly number[]): Promise<SessionDeletionPreview> {
         const user = this.current();
         if (this.#access !== "owner" || user.role !== "owner") throw new HttpError(403, "Only the owner can delete sessions.");

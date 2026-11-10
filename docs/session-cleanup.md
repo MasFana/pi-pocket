@@ -33,7 +33,10 @@ Public extension request methods:
 ```ts
 planSessionDeletion(ids: readonly number[]): Promise<SessionDeletionPreview>
 deleteSessions(request: { ids: readonly number[]; revision?: string; requestId: string }): Promise<SessionDeletionOutcome>
+subagentTree(): SessionSubagentRow[]
 ```
+
+`subagentTree()` lists the subagents the app knows for the owner's tree display. It never decides what is deleted: the preview's persisted ownership closure does, so a subagent that ended long ago is still included in its session's deletion.
 
 Server events emit `session.deleted` only after the purge committed.
 
